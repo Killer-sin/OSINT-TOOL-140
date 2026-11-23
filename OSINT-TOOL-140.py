@@ -11,8 +11,12 @@ import pytesseract
 from PIL import Image, ExifTags
 
 
-VERSION = "2.0.0"
+VERSION = "2.2.0"
 
+
+# ==========================================
+# 1. IMAGE METADATA
+# ==========================================
 
 def rational_to_float(value):
     try:
@@ -26,7 +30,7 @@ def get_decimal_from_dms(dms, ref):
     minutes = rational_to_float(dms[1])
     seconds = rational_to_float(dms[2])
 
-    decimal = degrees + (minutes / 60) + (seconds / 3600)
+    decimal = degrees + minutes / 60 + seconds / 3600
 
     if str(ref).upper() in ("S", "W"):
         decimal = -decimal
@@ -35,6 +39,7 @@ def get_decimal_from_dms(dms, ref):
 
 
 def extract_exif_metadata(image_path):
+
     metadata = {
         "Camera": "Not available",
         "Date": "Not available",
@@ -44,6 +49,7 @@ def extract_exif_metadata(image_path):
 
     try:
         with Image.open(image_path) as img:
+
             exif = img.getexif()
 
             if not exif:
@@ -58,7 +64,7 @@ def extract_exif_metadata(image_path):
             date_taken = exif.get(36867) or exif.get(306)
 
             if date_taken:
-                metadata["Date"] = str(date_taken).strip()
+                metadata["Date"] = str(date_taken)
 
             try:
                 gps_info = exif.get_ifd(ExifTags.IFD.GPSInfo)
@@ -66,6 +72,7 @@ def extract_exif_metadata(image_path):
                 gps_info = {}
 
             if gps_info:
+
                 gps = {}
 
                 for key, value in gps_info.items():
@@ -78,6 +85,7 @@ def extract_exif_metadata(image_path):
                 lon_ref = gps.get("GPSLongitudeRef")
 
                 if lat and lat_ref and lon and lon_ref:
+
                     lat_dec = get_decimal_from_dms(lat, lat_ref)
                     lon_dec = get_decimal_from_dms(lon, lon_ref)
 
@@ -85,77 +93,218 @@ def extract_exif_metadata(image_path):
                     metadata["Coordinates"] = (lat_dec, lon_dec)
 
     except (OSError, ValueError, TypeError) as error:
-        print(f"[!] EXIF warning: {error}", file=sys.stderr)
+        print(f"[!] EXIF warning: {error}")
 
     return metadata
 
 
-def preprocess_image(image_path):
+# ==========================================
+# 2. IMAGE LOADING
+# ==========================================
+
+def load_image(image_path):
+
+    image_data = np.fromfile(
+        str(image_path),
+        dtype=np.uint8
+    )
+
+    image = cv2.imdecode(
+        image_data,
+        cv2.IMREAD_COLOR
+    )
+
+    if image is None:
+        raise ValueError("Unable to load image.")
+
+    return image
+
+
+# ==========================================
+# 3. OCR LANGUAGE SUPPORT
+# ==========================================
+
+def get_tesseract_languages():
+
     try:
-        image_data = np.fromfile(str(image_path), dtype=np.uint8)
-        img = cv2.imdecode(image_data, cv2.IMREAD_COLOR)
-
-        if img is None:
-            raise ValueError("Unable to decode image.")
-
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        height, width = gray.shape
-
-        if width < 2000:
-            gray = cv2.resize(
-                gray,
-                None,
-                fx=2,
-                fy=2,
-                interpolation=cv2.INTER_CUBIC
-            )
-
-        denoised = cv2.GaussianBlur(gray, (5, 5), 0)
-
-        _, thresh = cv2.threshold(
-            denoised,
-            0,
-            255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        return set(
+            pytesseract.get_languages(config="")
         )
 
-        return thresh
+    except (
+        pytesseract.TesseractNotFoundError,
+        pytesseract.TesseractError
+    ):
+        return set()
 
-    except Exception as error:
-        raise ValueError(f"Image preprocessing failed: {error}") from error
 
+# ==========================================
+# 4. IMPROVED IMAGE PREPROCESSING
+# ==========================================
+
+def preprocess_image(image):
+
+    gray = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    height, width = gray.shape
+
+    # Enlarge small images
+    if max(height, width) < 1800:
+
+        scale = 3 if max(height, width) < 900 else 2
+
+        gray = cv2.resize(
+            gray,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_CUBIC
+        )
+
+    # Improve contrast
+    contrast = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8)
+    ).apply(gray)
+
+    # Remove noise
+    denoised = cv2.GaussianBlur(
+        contrast,
+        (3, 3),
+        0
+    )
+
+    # Adaptive threshold
+    adaptive = cv2.adaptiveThreshold(
+        denoised,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        11
+    )
+
+    return [contrast, adaptive]
+
+
+# ==========================================
+# 5. IMPROVED OCR EXTRACTION
+# ==========================================
 
 def extract_text(image_path):
-    processed_img = preprocess_image(image_path)
 
-    try:
-        raw_text = pytesseract.image_to_string(
-            processed_img,
-            lang="eng+ara"
+    image = load_image(image_path)
+
+    height, width = image.shape[:2]
+
+    installed_languages = get_tesseract_languages()
+
+    if "eng" not in installed_languages:
+        raise RuntimeError(
+            "English OCR data is missing. "
+            "Install eng.traineddata."
         )
 
-    except pytesseract.TesseractError:
+    languages = ["eng"]
+
+    if "ara" in installed_languages:
+        languages.append("ara")
+    else:
         print(
-            "[!] Arabic OCR unavailable. Falling back to English.",
-            file=sys.stderr
+            "[!] Arabic OCR data not found. "
+            "Using English only."
         )
 
-        raw_text = pytesseract.image_to_string(
-            processed_img,
-            lang="eng"
-        )
+    language_config = "+".join(languages)
 
-    lines = [
-        line.strip()
-        for line in raw_text.splitlines()
-        if len(line.strip()) > 1
+    # Full image and smaller regions
+    regions = [
+        image,
+        image[:height // 2, :],
+        image[height // 2:, :],
+        image[:, :width // 2],
+        image[:, width // 2:]
     ]
 
-    return lines, raw_text
+    detected_words = []
 
+    for region in regions:
+
+        prepared_images = preprocess_image(region)
+
+        for prepared in prepared_images:
+
+            for psm in (6, 11):
+
+                try:
+
+                    data = pytesseract.image_to_data(
+                        prepared,
+                        lang=language_config,
+                        config=f"--oem 3 --psm {psm}",
+                        output_type=pytesseract.Output.DICT
+                    )
+
+                    for word, confidence in zip(
+                        data["text"],
+                        data["conf"]
+                    ):
+
+                        word = word.strip()
+
+                        try:
+                            confidence = float(confidence)
+                        except (TypeError, ValueError):
+                            continue
+
+                        # Filter weak OCR results
+                        if confidence >= 50 and len(word) >= 2:
+
+                            detected_words.append(
+                                (word, confidence)
+                            )
+
+                except pytesseract.TesseractError as error:
+
+                    print(
+                        f"[!] OCR error: {error}"
+                    )
+
+    if not detected_words:
+        return [], ""
+
+    # Keep the highest-confidence occurrence of each word
+    best_words = {}
+
+    for word, confidence in detected_words:
+
+        key = word.casefold()
+
+        if (
+            key not in best_words
+            or confidence > best_words[key][1]
+        ):
+            best_words[key] = (word, confidence)
+
+    final_words = [
+        item[0]
+        for item in best_words.values()
+    ]
+
+    raw_text = " ".join(final_words)
+
+    return final_words, raw_text
+
+
+# ==========================================
+# 6. LANGUAGE DETECTION
+# ==========================================
 
 def detect_languages(text):
+
     languages = []
 
     if re.search(r"[A-Za-z]", text):
@@ -164,10 +313,18 @@ def detect_languages(text):
     if re.search(r"[\u0600-\u06FF]", text):
         languages.append("Arabic")
 
-    return " / ".join(languages) if languages else "Unknown"
+    if not languages:
+        return "Unknown (no readable text extracted)"
 
+    return " / ".join(languages)
+
+
+# ==========================================
+# 7. OSINT CLUE ANALYSIS
+# ==========================================
 
 def analyze_clues(lines, raw_text):
+
     clues = {
         "Websites": [],
         "Emails": [],
@@ -176,16 +333,10 @@ def analyze_clues(lines, raw_text):
         "Businesses": []
     }
 
+    # Website detection
     url_pattern = re.compile(
         r"\b(?:https?://|www\.)"
-        r"[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
-        r"(?:/[^\s]*)?",
-        re.IGNORECASE
-    )
-
-    domain_pattern = re.compile(
-        r"\b[a-zA-Z0-9-]+\."
-        r"(?:com|net|org|io|co|gov|edu|bh|ae|sa|uk|us)\b",
+        r"[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
         re.IGNORECASE
     )
 
@@ -194,35 +345,38 @@ def analyze_clues(lines, raw_text):
         r"@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
     )
 
+    # Phone numbers
     phone_pattern = re.compile(
-        r"(?<!\w)(?:\+?\d{1,3}[\s-]?)?"
-        r"(?:\(?\d{2,4}\)?[\s-]?)?"
-        r"\d{3,4}[\s-]?\d{4}(?!\w)"
+        r"(?<!\w)\+?\d[\d\s()-]{6,18}\d(?!\w)"
     )
 
-    street_keywords = (
-        r"\b(?:street|st|road|rd|avenue|ave|"
-        r"boulevard|blvd|lane|ln|drive|dr|"
-        r"way|highway|hwy|شارع|طريق|مجمع)\b"
+    # Use full words to avoid false matches like "st"
+    street_pattern = re.compile(
+        r"\b(street|road|avenue|boulevard|"
+        r"lane|drive|highway)\b",
+        re.IGNORECASE
     )
 
-    business_keywords = (
-        r"\b(?:pharmacy|shop|store|market|supermarket|"
-        r"cafe|coffee|restaurant|hotel|bank|clinic|"
-        r"hospital|center|centre|ltd|llc|inc|co|"
-        r"corp|company|bakery|salon|mall|"
-        r"صيدلية|مطعم|مقهى|محل|شركة|مركز|بنك)\b"
+    business_pattern = re.compile(
+        r"\b(pharmacy|shop|store|market|"
+        r"supermarket|cafe|coffee|restaurant|"
+        r"hotel|bank|clinic|hospital|center|"
+        r"centre|company|bakery|salon|mall)\b",
+        re.IGNORECASE
     )
 
-    urls = set(url_pattern.findall(raw_text))
-    domains = set(domain_pattern.findall(raw_text))
+    clues["Websites"] = sorted(
+        set(url_pattern.findall(raw_text))
+    )
 
-    clues["Websites"] = sorted(urls.union(domains))
-    clues["Emails"] = sorted(set(email_pattern.findall(raw_text)))
+    clues["Emails"] = sorted(
+        set(email_pattern.findall(raw_text))
+    )
 
     phones = set()
 
     for phone in phone_pattern.findall(raw_text):
+
         digits = re.sub(r"\D", "", phone)
 
         if 7 <= len(digits) <= 15:
@@ -231,20 +385,35 @@ def analyze_clues(lines, raw_text):
     clues["Phones"] = sorted(phones)
 
     for line in lines:
-        if re.search(street_keywords, line, re.IGNORECASE):
+
+        if street_pattern.search(line):
             clues["Streets"].append(line)
 
-        if re.search(business_keywords, line, re.IGNORECASE):
+        if business_pattern.search(line):
             clues["Businesses"].append(line)
 
-    clues["Streets"] = sorted(set(clues["Streets"]))
-    clues["Businesses"] = sorted(set(clues["Businesses"]))
+    clues["Streets"] = sorted(
+        set(clues["Streets"])
+    )
+
+    clues["Businesses"] = sorted(
+        set(clues["Businesses"])
+    )
 
     return clues
 
 
-def generate_report(image_path, lines, languages, metadata, clues):
-    filename = Path(image_path).name
+# ==========================================
+# 8. REPORT GENERATION
+# ==========================================
+
+def generate_report(
+    image_path,
+    lines,
+    languages,
+    metadata,
+    clues
+):
 
     report = []
 
@@ -254,82 +423,142 @@ def generate_report(image_path, lines, languages, metadata, clues):
     report.append(f"                 Version {VERSION}")
     report.append("=" * 60)
 
-    report.append(f"\nImage: {filename}")
+    report.append(
+        f"\nImage: {Path(image_path).name}"
+    )
 
+    # DETECTED TEXT
     report.append("\n[1] DETECTED TEXT")
     report.append("-" * 60)
 
     if lines:
+
         for line in lines:
-            report.append(f'  "{line}"')
+            report.append(f"  {line}")
+
     else:
         report.append("  No readable text detected.")
 
+    # LANGUAGE
     report.append("\n[2] LANGUAGE ANALYSIS")
     report.append("-" * 60)
-    report.append(f"  Detected language: {languages}")
 
+    report.append(
+        f"  Detected language: {languages}"
+    )
+
+    # METADATA
     report.append("\n[3] IMAGE METADATA")
     report.append("-" * 60)
 
-    report.append(f"  Camera: {metadata['Camera']}")
-    report.append(f"  Date:   {metadata['Date']}")
-    report.append(f"  GPS:    {metadata['GPS']}")
+    report.append(
+        f"  Camera: {metadata['Camera']}"
+    )
+
+    report.append(
+        f"  Date: {metadata['Date']}"
+    )
+
+    report.append(
+        f"  GPS: {metadata['GPS']}"
+    )
 
     if metadata["Coordinates"]:
+
         lat, lon = metadata["Coordinates"]
 
         map_link = (
-            f"https://www.openstreetmap.org/"
-            f"?mlat={lat}&mlon={lon}#map=16/{lat}/{lon}"
+            "https://www.openstreetmap.org/"
+            f"?mlat={lat}&mlon={lon}"
+            f"#map=16/{lat}/{lon}"
         )
 
-        report.append(f"  Map Link: {map_link}")
+        report.append(
+            f"  Map: {map_link}"
+        )
 
+    # OSINT CLUES
     report.append("\n[4] POTENTIAL OSINT CLUES")
     report.append("-" * 60)
 
     categories = [
         ("Businesses", "Business"),
         ("Streets", "Street"),
-        ("Websites", "Website / Domain"),
+        ("Websites", "Website"),
         ("Emails", "Email"),
         ("Phones", "Phone")
     ]
 
-    has_clues = False
+    found = False
 
     for category, label in categories:
-        if clues[category]:
-            has_clues = True
 
-            for item in clues[category]:
-                report.append(f"  - {label}: {item}")
+        for item in clues[category]:
 
-    if not has_clues:
-        report.append("  No structured clues identified.")
+            found = True
 
+            report.append(
+                f"  - {label}: {item}"
+            )
+
+    if not found:
+        report.append(
+            "  No structured clues identified."
+        )
+
+    # DISCLAIMER
     report.append("\n[5] DISCLAIMER")
     report.append("-" * 60)
-    report.append("  Results are automatically extracted clues.")
-    report.append("  OCR results may contain errors or false positives.")
-    report.append("  GPS metadata may be missing, inaccurate, or outdated.")
-    report.append("  Findings do not independently establish a person's")
-    report.append("  identity or the exact location of an image.")
+
+    report.append(
+        "  Results are automatically extracted clues."
+    )
+
+    report.append(
+        "  OCR results may contain errors or false positives."
+    )
+
+    report.append(
+        "  GPS metadata may be missing, inaccurate, or outdated."
+    )
+
+    report.append(
+        "  Text and business names are not verified facts."
+    )
+
+    report.append(
+        "  Visual clues do not prove an exact location."
+    )
+
+    report.append(
+        "  Findings do not independently establish a person's identity."
+    )
 
     report.append("=" * 60)
 
     return "\n".join(report)
 
 
+# ==========================================
+# 9. MAIN PROGRAM
+# ==========================================
+
 def main():
+
     parser = argparse.ArgumentParser(
-        description="PhotoClue OSINT - Image Metadata and Text Analysis Tool",
-        epilog="Example: python photoclue.py photo.jpg -o report.txt"
+        description="PhotoClue OSINT Image Analysis Tool"
     )
 
-    parser.add_argument("image", help="Path to the input image")
-    parser.add_argument("-o", "--output", help="Optional report output path")
+    parser.add_argument(
+        "image",
+        help="Image file path"
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="Save report to a text file"
+    )
 
     parser.add_argument(
         "--version",
@@ -342,16 +571,35 @@ def main():
     image_path = Path(args.image)
 
     if not image_path.is_file():
-        print(f"[ERROR] File not found: {image_path}")
+
+        print(
+            f"[ERROR] Image not found: {image_path}"
+        )
+
         sys.exit(1)
 
     print("\n[*] PhotoClue OSINT starting...")
+
     print("[*] Extracting image metadata...")
 
+    available_languages = get_tesseract_languages()
+
+    print(
+        "[*] Tesseract languages available: "
+        + (
+            ", ".join(sorted(available_languages))
+            if available_languages
+            else "None"
+        )
+    )
+
     try:
+
         metadata = extract_exif_metadata(image_path)
 
-        print("[*] Processing image and extracting text...")
+        print(
+            "[*] Processing image and extracting text..."
+        )
 
         lines, raw_text = extract_text(image_path)
 
@@ -359,7 +607,9 @@ def main():
 
         languages = detect_languages(raw_text)
 
-        print("[*] Analyzing potential OSINT clues...")
+        print(
+            "[*] Analyzing potential OSINT clues..."
+        )
 
         clues = analyze_clues(lines, raw_text)
 
@@ -376,21 +626,30 @@ def main():
         print("\n" + report)
 
         if args.output:
-            output_path = Path(args.output)
 
-            output_path.write_text(
+            Path(args.output).write_text(
                 report,
                 encoding="utf-8"
             )
 
-            print(f"\n[+] Report saved: {output_path}")
+            print(
+                f"\n[+] Report saved: {args.output}"
+            )
 
-        print("\n[+] Analysis completed successfully.")
+        print(
+            "\n[+] Analysis completed successfully."
+        )
 
     except Exception as error:
-        print(f"\n[ERROR] {error}", file=sys.stderr)
+
+        print(
+            f"\n[ERROR] {error}",
+            file=sys.stderr
+        )
+
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+
