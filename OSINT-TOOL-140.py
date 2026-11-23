@@ -1,19 +1,36 @@
-import os
+
+import argparse
 import re
 import sys
-import argparse
+from pathlib import Path
+
 import cv2
+import numpy as np
 import pytesseract
+
 from PIL import Image, ExifTags
 
 
+VERSION = "2.0.0"
+
+
+def rational_to_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
 def get_decimal_from_dms(dms, ref):
-    degrees = float(dms[0])
-    minutes = float(dms[1]) / 60.0
-    seconds = float(dms[2]) / 3600.0
-    decimal = degrees + minutes + seconds
-    if ref in ['S', 'W']:
+    degrees = rational_to_float(dms[0])
+    minutes = rational_to_float(dms[1])
+    seconds = rational_to_float(dms[2])
+
+    decimal = degrees + (minutes / 60) + (seconds / 3600)
+
+    if str(ref).upper() in ("S", "W"):
         decimal = -decimal
+
     return round(decimal, 6)
 
 
@@ -24,77 +41,129 @@ def extract_exif_metadata(image_path):
         "GPS": "Not available",
         "Coordinates": None
     }
+
     try:
         with Image.open(image_path) as img:
-            exif_raw = img._getexif()
-            if not exif_raw:
+            exif = img.getexif()
+
+            if not exif:
                 return metadata
 
-            exif_data = {}
-            for tag_id, value in exif_raw.items():
-                tag = ExifTags.TAGS.get(tag_id, tag_id)
-                exif_data[tag] = value
+            make = str(exif.get(271, "")).strip()
+            model = str(exif.get(272, "")).strip()
 
-            make = str(exif_data.get("Make", "")).strip()
-            model = str(exif_data.get("Model", "")).strip()
             if make or model:
                 metadata["Camera"] = f"{make} {model}".strip()
 
-            date_taken = exif_data.get("DateTimeOriginal") or exif_data.get("DateTime")
+            date_taken = exif.get(36867) or exif.get(306)
+
             if date_taken:
                 metadata["Date"] = str(date_taken).strip()
 
-            gps_info = exif_data.get("GPSInfo")
-            if gps_info:
-                gps_parsed = {}
-                for key in gps_info.keys():
-                    decode = ExifTags.GPSTAGS.get(key, key)
-                    gps_parsed[decode] = gps_info[key]
+            try:
+                gps_info = exif.get_ifd(ExifTags.IFD.GPSInfo)
+            except (AttributeError, KeyError, TypeError):
+                gps_info = {}
 
-                lat = gps_parsed.get("GPSLatitude")
-                lat_ref = gps_parsed.get("GPSLatitudeRef")
-                lon = gps_parsed.get("GPSLongitude")
-                lon_ref = gps_parsed.get("GPSLongitudeRef")
+            if gps_info:
+                gps = {}
+
+                for key, value in gps_info.items():
+                    tag = ExifTags.GPSTAGS.get(key, key)
+                    gps[tag] = value
+
+                lat = gps.get("GPSLatitude")
+                lat_ref = gps.get("GPSLatitudeRef")
+                lon = gps.get("GPSLongitude")
+                lon_ref = gps.get("GPSLongitudeRef")
 
                 if lat and lat_ref and lon and lon_ref:
                     lat_dec = get_decimal_from_dms(lat, lat_ref)
                     lon_dec = get_decimal_from_dms(lon, lon_ref)
+
                     metadata["GPS"] = f"{lat_dec}, {lon_dec}"
                     metadata["Coordinates"] = (lat_dec, lon_dec)
-    except Exception:
-        pass
+
+    except (OSError, ValueError, TypeError) as error:
+        print(f"[!] EXIF warning: {error}", file=sys.stderr)
 
     return metadata
 
 
 def preprocess_image(image_path):
-    img = cv2.imread(image_path)
-    if img is None:
-        raise ValueError(f"Unable to load image: {image_path}")
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    denoised = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return thresh
+    try:
+        image_data = np.fromfile(str(image_path), dtype=np.uint8)
+        img = cv2.imdecode(image_data, cv2.IMREAD_COLOR)
+
+        if img is None:
+            raise ValueError("Unable to decode image.")
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        height, width = gray.shape
+
+        if width < 2000:
+            gray = cv2.resize(
+                gray,
+                None,
+                fx=2,
+                fy=2,
+                interpolation=cv2.INTER_CUBIC
+            )
+
+        denoised = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        _, thresh = cv2.threshold(
+            denoised,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+
+        return thresh
+
+    except Exception as error:
+        raise ValueError(f"Image preprocessing failed: {error}") from error
 
 
 def extract_text(image_path):
     processed_img = preprocess_image(image_path)
-    try:
-        raw_text = pytesseract.image_to_string(processed_img, lang="eng+ara")
-    except pytesseract.TesseractError:
-        raw_text = pytesseract.image_to_string(processed_img, lang="eng")
 
-    lines = [line.strip() for line in raw_text.splitlines() if len(line.strip()) > 1]
+    try:
+        raw_text = pytesseract.image_to_string(
+            processed_img,
+            lang="eng+ara"
+        )
+
+    except pytesseract.TesseractError:
+        print(
+            "[!] Arabic OCR unavailable. Falling back to English.",
+            file=sys.stderr
+        )
+
+        raw_text = pytesseract.image_to_string(
+            processed_img,
+            lang="eng"
+        )
+
+    lines = [
+        line.strip()
+        for line in raw_text.splitlines()
+        if len(line.strip()) > 1
+    ]
+
     return lines, raw_text
 
 
 def detect_languages(text):
     languages = []
-    if re.search(r'[A-Za-z]', text):
+
+    if re.search(r"[A-Za-z]", text):
         languages.append("English")
-    if re.search(r'[\u0600-\u06FF]', text):
+
+    if re.search(r"[\u0600-\u06FF]", text):
         languages.append("Arabic")
+
     return " / ".join(languages) if languages else "Unknown"
 
 
@@ -107,120 +176,219 @@ def analyze_clues(lines, raw_text):
         "Businesses": []
     }
 
-    url_pattern = re.compile(r'\b(?:https?://|www\.)[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/[^\s]*)?\b', re.IGNORECASE)
-    domain_pattern = re.compile(r'\b[a-zA-Z0-9-]+\.(?:com|net|org|io|co|gov|edu|bh|ae|sa|uk|us)\b', re.IGNORECASE)
-    email_pattern = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
-    phone_pattern = re.compile(r'(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{2,4}\)?[\s-]?)?\d{3,4}[\s-]?\d{4}')
+    url_pattern = re.compile(
+        r"\b(?:https?://|www\.)"
+        r"[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
+        r"(?:/[^\s]*)?",
+        re.IGNORECASE
+    )
 
-    street_keywords = r'\b(?:street|st|road|rd|avenue|ave|boulevard|blvd|lane|ln|drive|dr|way|highway|hwy|شارع|طريق|مجمع)\b'
-    business_keywords = r'\b(?:pharmacy|shop|store|market|supermarket|cafe|coffee|restaurant|hotel|bank|clinic|hospital|center|centre|ltd|llc|inc|co|corp|company|bakery|salon|mall|صيدلية|مطعم|مقهى|محل|شركة|مركز|بنك)\b'
+    domain_pattern = re.compile(
+        r"\b[a-zA-Z0-9-]+\."
+        r"(?:com|net|org|io|co|gov|edu|bh|ae|sa|uk|us)\b",
+        re.IGNORECASE
+    )
+
+    email_pattern = re.compile(
+        r"\b[A-Za-z0-9._%+-]+"
+        r"@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+    )
+
+    phone_pattern = re.compile(
+        r"(?<!\w)(?:\+?\d{1,3}[\s-]?)?"
+        r"(?:\(?\d{2,4}\)?[\s-]?)?"
+        r"\d{3,4}[\s-]?\d{4}(?!\w)"
+    )
+
+    street_keywords = (
+        r"\b(?:street|st|road|rd|avenue|ave|"
+        r"boulevard|blvd|lane|ln|drive|dr|"
+        r"way|highway|hwy|شارع|طريق|مجمع)\b"
+    )
+
+    business_keywords = (
+        r"\b(?:pharmacy|shop|store|market|supermarket|"
+        r"cafe|coffee|restaurant|hotel|bank|clinic|"
+        r"hospital|center|centre|ltd|llc|inc|co|"
+        r"corp|company|bakery|salon|mall|"
+        r"صيدلية|مطعم|مقهى|محل|شركة|مركز|بنك)\b"
+    )
 
     urls = set(url_pattern.findall(raw_text))
     domains = set(domain_pattern.findall(raw_text))
-    clues["Websites"] = sorted(list(urls.union(domains)))
-    clues["Emails"] = sorted(list(set(email_pattern.findall(raw_text))))
-    clues["Phones"] = sorted(list(set(p.strip() for p in phone_pattern.findall(raw_text) if len(re.sub(r'\D', '', p)) >= 7)))
+
+    clues["Websites"] = sorted(urls.union(domains))
+    clues["Emails"] = sorted(set(email_pattern.findall(raw_text)))
+
+    phones = set()
+
+    for phone in phone_pattern.findall(raw_text):
+        digits = re.sub(r"\D", "", phone)
+
+        if 7 <= len(digits) <= 15:
+            phones.add(phone.strip())
+
+    clues["Phones"] = sorted(phones)
 
     for line in lines:
         if re.search(street_keywords, line, re.IGNORECASE):
             clues["Streets"].append(line)
+
         if re.search(business_keywords, line, re.IGNORECASE):
             clues["Businesses"].append(line)
 
-    clues["Streets"] = sorted(list(set(clues["Streets"])))
-    clues["Businesses"] = sorted(list(set(clues["Businesses"])))
+    clues["Streets"] = sorted(set(clues["Streets"]))
+    clues["Businesses"] = sorted(set(clues["Businesses"]))
 
     return clues
 
 
 def generate_report(image_path, lines, languages, metadata, clues):
-    filename = os.path.basename(image_path)
-    report = []
-    report.append("=" * 50)
-    report.append("PHOTOCLUE OSINT REPORT")
-    report.append("=" * 50)
-    report.append(f"Image: {filename}\n")
+    filename = Path(image_path).name
 
-    report.append("Detected Text:")
+    report = []
+
+    report.append("=" * 60)
+    report.append("                 PHOTOCLUE OSINT")
+    report.append("          IMAGE ANALYSIS REPORT")
+    report.append(f"                 Version {VERSION}")
+    report.append("=" * 60)
+
+    report.append(f"\nImage: {filename}")
+
+    report.append("\n[1] DETECTED TEXT")
+    report.append("-" * 60)
+
     if lines:
         for line in lines:
             report.append(f'  "{line}"')
     else:
         report.append("  No readable text detected.")
-    report.append("")
 
-    report.append("Possible Language:")
-    report.append(f"  {languages}\n")
+    report.append("\n[2] LANGUAGE ANALYSIS")
+    report.append("-" * 60)
+    report.append(f"  Detected language: {languages}")
 
-    report.append("Image Metadata:")
+    report.append("\n[3] IMAGE METADATA")
+    report.append("-" * 60)
+
     report.append(f"  Camera: {metadata['Camera']}")
-    report.append(f"  Date: {metadata['Date']}")
-    report.append(f"  GPS: {metadata['GPS']}")
+    report.append(f"  Date:   {metadata['Date']}")
+    report.append(f"  GPS:    {metadata['GPS']}")
+
     if metadata["Coordinates"]:
         lat, lon = metadata["Coordinates"]
-        report.append(f"  Map Link: https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=16/{lat}/{lon}")
-    report.append("")
 
-    report.append("Potential OSINT Clues:")
+        map_link = (
+            f"https://www.openstreetmap.org/"
+            f"?mlat={lat}&mlon={lon}#map=16/{lat}/{lon}"
+        )
+
+        report.append(f"  Map Link: {map_link}")
+
+    report.append("\n[4] POTENTIAL OSINT CLUES")
+    report.append("-" * 60)
+
+    categories = [
+        ("Businesses", "Business"),
+        ("Streets", "Street"),
+        ("Websites", "Website / Domain"),
+        ("Emails", "Email"),
+        ("Phones", "Phone")
+    ]
+
     has_clues = False
-    if clues["Businesses"]:
-        has_clues = True
-        for b in clues["Businesses"]:
-            report.append(f"  - Business name: {b}")
-    if clues["Streets"]:
-        has_clues = True
-        for s in clues["Streets"]:
-            report.append(f"  - Street name: {s}")
-    if clues["Websites"]:
-        has_clues = True
-        for w in clues["Websites"]:
-            report.append(f"  - Website/domain: {w}")
-    if clues["Emails"]:
-        has_clues = True
-        for e in clues["Emails"]:
-            report.append(f"  - Email address: {e}")
-    if clues["Phones"]:
-        has_clues = True
-        for p in clues["Phones"]:
-            report.append(f"  - Phone number: {p}")
-    if not has_clues:
-        report.append("  - No specific structured clues identified from text.")
-    report.append("")
 
-    report.append("Note:")
-    report.append("  The results are clues only and do not automatically confirm")
-    report.append("  the exact location or identity of a person.")
-    report.append("=" * 50)
+    for category, label in categories:
+        if clues[category]:
+            has_clues = True
+
+            for item in clues[category]:
+                report.append(f"  - {label}: {item}")
+
+    if not has_clues:
+        report.append("  No structured clues identified.")
+
+    report.append("\n[5] DISCLAIMER")
+    report.append("-" * 60)
+    report.append("  Results are automatically extracted clues.")
+    report.append("  OCR results may contain errors or false positives.")
+    report.append("  GPS metadata may be missing, inaccurate, or outdated.")
+    report.append("  Findings do not independently establish a person's")
+    report.append("  identity or the exact location of an image.")
+
+    report.append("=" * 60)
 
     return "\n".join(report)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PhotoClue OSINT - Image Reconnaissance Tool")
-    parser.add_argument("image", help="Path to the input image file (JPG, PNG, etc.)")
-    parser.add_argument("-o", "--output", help="Optional path to save the report as a text file")
+    parser = argparse.ArgumentParser(
+        description="PhotoClue OSINT - Image Metadata and Text Analysis Tool",
+        epilog="Example: python photoclue.py photo.jpg -o report.txt"
+    )
+
+    parser.add_argument("image", help="Path to the input image")
+    parser.add_argument("-o", "--output", help="Optional report output path")
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"PhotoClue OSINT {VERSION}"
+    )
+
     args = parser.parse_args()
 
-    if not os.path.isfile(args.image):
-        print(f"Error: File '{args.image}' not found.")
+    image_path = Path(args.image)
+
+    if not image_path.is_file():
+        print(f"[ERROR] File not found: {image_path}")
         sys.exit(1)
 
-    try:
-        metadata = extract_exif_metadata(args.image)
-        lines, raw_text = extract_text(args.image)
-        languages = detect_languages(raw_text)
-        clues = analyze_clues(lines, raw_text)
-        report = generate_report(args.image, lines, languages, metadata, clues)
+    print("\n[*] PhotoClue OSINT starting...")
+    print("[*] Extracting image metadata...")
 
-        print(report)
+    try:
+        metadata = extract_exif_metadata(image_path)
+
+        print("[*] Processing image and extracting text...")
+
+        lines, raw_text = extract_text(image_path)
+
+        print("[*] Detecting languages...")
+
+        languages = detect_languages(raw_text)
+
+        print("[*] Analyzing potential OSINT clues...")
+
+        clues = analyze_clues(lines, raw_text)
+
+        print("[*] Generating report...")
+
+        report = generate_report(
+            image_path,
+            lines,
+            languages,
+            metadata,
+            clues
+        )
+
+        print("\n" + report)
 
         if args.output:
-            with open(args.output, "w", encoding="utf-8") as f:
-                f.write(report)
-            print(f"\nReport saved to {args.output}")
+            output_path = Path(args.output)
 
-    except Exception as e:
-        print(f"Error processing image: {e}")
+            output_path.write_text(
+                report,
+                encoding="utf-8"
+            )
+
+            print(f"\n[+] Report saved: {output_path}")
+
+        print("\n[+] Analysis completed successfully.")
+
+    except Exception as error:
+        print(f"\n[ERROR] {error}", file=sys.stderr)
         sys.exit(1)
 
 
