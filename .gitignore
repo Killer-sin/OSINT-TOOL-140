@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.log
+.env
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Private images and generated reports
+*.jpg
+*.jpeg
+*.png
+*.webp
+reports/*
+!reports/.gitkeep
